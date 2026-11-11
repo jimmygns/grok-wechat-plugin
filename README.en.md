@@ -19,7 +19,7 @@ WeChat iLink channel for Grok Bot. After QR bind, DMs wake the matching dedicate
 Send this in Grok Bot:
 
 ```
-Install this WeChat plugin https://github.com/little-thing/grok-wechat-plugin
+Install this WeChat plugin https://github.com/jimmygns/grok-wechat-plugin
 ```
 
 ## Binding
@@ -85,4 +85,4 @@ The installing assistant will:
 3. Delete Routine「微信入站唤醒」and「微信监听保活」on the installing assistant, and remove any leftover copies on other assistants.
 4. Tell the user to right-click → Delete the dedicated assistants listed in the uninstall response (e.g. 微信1, 微信2) in the sidebar.
 
-Removing the connector from Settings also triggers local monitor cleanup. After a clean uninstall, reinstall requires a fresh webhook paste and QR scan; `wechat_status` shows zero accounts.
+After a clean uninstall, reinstall requires a fresh webhook paste and QR scan; `wechat_status` shows zero accounts.

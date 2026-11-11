@@ -19,7 +19,7 @@ Grok Bot 的微信 iLink 渠道。扫码绑定个人号后，私信经共享 web
 在 Grok Bot 里发：
 
 ```
-安装这个微信插件 https://github.com/little-thing/grok-wechat-plugin
+安装这个微信插件 https://github.com/jimmygns/grok-wechat-plugin
 ```
 
 ## 绑定流程
@@ -83,4 +83,4 @@ Grok Bot 的微信 iLink 渠道。扫码绑定个人号后，私信经共享 web
 3. 删除安装助手上 Routine「微信入站唤醒」与「微信监听保活」，并删除其他助手上残留的同名 Routine。
 4. 告知用户在侧栏右键删除返回列表中的专属助手（如「微信1」「微信2」）。
 
-从 Settings 卸掉连接器后，本机 monitor 也会自动清理。完成后重装需重新粘贴 webhook 并扫码，`wechat_status` 为零账号。
+完成后重装需重新粘贴 webhook 并扫码，`wechat_status` 为零账号。

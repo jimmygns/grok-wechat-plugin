@@ -12,11 +12,11 @@ description: 用户要在 Grok Bot 里安装、登录、收发、登出或卸载
 
 `base_info.bot_agent = Grokbot/1.0.0`。连接页显示 Grokbot。微信里的「ClawBot」是腾讯产品名。
 
-仓库：https://github.com/little-thing/grok-wechat-plugin
+仓库：https://github.com/jimmygns/grok-wechat-plugin
 
 ## 安装
 
-用户发一句「安装这个微信插件 https://github.com/little-thing/grok-wechat-plugin」即完成本渠道安装。技能就是本文件（本插件 `skills/wechat-channel/SKILL.md`）。
+用户发一句「安装这个微信插件 https://github.com/jimmygns/grok-wechat-plugin」即完成本渠道安装。技能就是本文件（本插件 `skills/wechat-channel/SKILL.md`）。
 
 安装完成后 Grok Bot 上具备：
 
@@ -97,7 +97,7 @@ stdio 支持换行分隔 JSON 与 Content-Length 分帧。
 - 删除 `/home/box/grok-wechat-plugin` 与 `GROK_WECHAT_HOME` / `/home/box/.grok-wechat`（含 `account.json`、`wake.json`、token、inbox、media、pid、log、`ensure-monitor.sh`）
 - 清理 crontab 与 shell 自启项
 
-返回 `dedicated_assistants_sidebar_delete`（绑定期间登记的专属助手名称）。从 Settings 卸掉连接器后，monitor 也会自动完成本机清理。
+返回 `dedicated_assistants_sidebar_delete`（绑定期间登记的专属助手名称）。
 
 ### 2. 平台清理（安装助手执行）
 
