@@ -4,8 +4,10 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-const DEFAULT_BASE = "https://ilinkai.weixin.qq.com";
+export const DEFAULT_BASE = "https://ilinkai.weixin.qq.com";
 const MAX_LOCAL_TOKENS = 10;
+const LOCK_WAIT_BUF = new Int32Array(new SharedArrayBuffer(4));
+const HELD_LOCKS = new Set();
 
 export function homeDir() {
   const raw = process.env.GROK_WECHAT_HOME?.trim();
@@ -22,6 +24,9 @@ export function paths() {
     pid: path.join(home, "monitor.pid"),
     media: path.join(home, "media"),
     log: path.join(home, "monitor.log"),
+    stateLock: path.join(home, "state.lock"),
+    inboxLock: path.join(home, "inbox.lock"),
+    monitorLock: path.join(home, "monitor.lock"),
   };
 }
 
@@ -49,8 +54,68 @@ export function emptyState() {
 
 function ensureHome() {
   const { home, media } = paths();
-  fs.mkdirSync(home, { recursive: true });
-  fs.mkdirSync(media, { recursive: true });
+  fs.mkdirSync(home, { recursive: true, mode: 0o700 });
+  fs.mkdirSync(media, { recursive: true, mode: 0o700 });
+  try {
+    fs.chmodSync(home, 0o700);
+    fs.chmodSync(media, 0o700);
+  } catch {
+    // ignore on filesystems without POSIX permissions
+  }
+}
+
+function uniqueTmp(target) {
+  return `${target}.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2, 8)}.tmp`;
+}
+
+export function withFileLock(lockFile, fn, { timeoutMs = 5_000, staleMs = 30_000 } = {}) {
+  ensureHome();
+  const resolved = path.resolve(lockFile);
+  if (HELD_LOCKS.has(resolved)) {
+    return fn();
+  }
+  const deadline = Date.now() + timeoutMs;
+  const token = `${process.pid}:${Date.now()}`;
+  while (true) {
+    try {
+      fs.writeFileSync(resolved, token, { flag: "wx", mode: 0o600 });
+      break;
+    } catch (err) {
+      if (err?.code !== "EEXIST") throw err;
+      try {
+        const raw = fs.readFileSync(resolved, "utf8").trim();
+        const [pidStr, tsStr] = raw.split(":");
+        const ownerPid = Number(pidStr);
+        const ts = Number(tsStr);
+        const ownerDead = Number.isInteger(ownerPid) && ownerPid > 0 && !isPidAlive(ownerPid);
+        const expired = !Number.isFinite(ts) || Date.now() - ts > staleMs;
+        if (ownerDead || expired) {
+          fs.unlinkSync(resolved);
+          continue;
+        }
+      } catch {
+        // lock file disappeared between check and read; retry
+        continue;
+      }
+      if (Date.now() >= deadline) {
+        throw new Error(`等待文件锁超时: ${resolved}`);
+      }
+      Atomics.wait(LOCK_WAIT_BUF, 0, 0, 10);
+    }
+  }
+  HELD_LOCKS.add(resolved);
+  try {
+    return fn();
+  } finally {
+    HELD_LOCKS.delete(resolved);
+    try {
+      if (fs.existsSync(resolved) && fs.readFileSync(resolved, "utf8").trim() === token) {
+        fs.unlinkSync(resolved);
+      }
+    } catch {
+      // ignore
+    }
+  }
 }
 
 function migrateLegacyState(raw) {
@@ -79,10 +144,24 @@ export function loadState() {
   ensureHome();
   const { state } = paths();
   if (!fs.existsSync(state)) return emptyState();
+  let content = "";
   try {
-    const raw = JSON.parse(fs.readFileSync(state, "utf8"));
+    content = fs.readFileSync(state, "utf8");
+  } catch {
+    return emptyState();
+  }
+  if (!content.trim()) return emptyState();
+  try {
+    const raw = JSON.parse(content);
     return { ...emptyState(), ...migrateLegacyState(raw) };
   } catch {
+    try {
+      const backup = `${state}.corrupt.${Date.now()}`;
+      fs.renameSync(state, backup);
+      fs.chmodSync(backup, 0o600);
+    } catch {
+      // ignore
+    }
     return emptyState();
   }
 }
@@ -90,16 +169,32 @@ export function loadState() {
 export function saveState(next) {
   ensureHome();
   const { state } = paths();
-  const tmp = `${state}.tmp`;
-  fs.writeFileSync(tmp, JSON.stringify(next, null, 2));
+  const tmp = uniqueTmp(state);
+  fs.writeFileSync(tmp, JSON.stringify(next, null, 2), { mode: 0o600 });
   fs.renameSync(tmp, state);
+  try {
+    fs.chmodSync(state, 0o600);
+  } catch {
+    // ignore
+  }
 }
 
 export function updateState(mutator) {
-  const current = loadState();
-  const next = mutator(current) ?? current;
-  saveState(next);
-  return next;
+  return withFileLock(paths().stateLock, () => {
+    const current = loadState();
+    const next = mutator(current) ?? current;
+    saveState(next);
+    return next;
+  });
+}
+
+export function commitUpdatesBuf(token, nextBuf) {
+  if (!token || typeof nextBuf !== "string") return;
+  updateState((s) => {
+    const hit = findAccount(s, { token });
+    if (hit) hit.getUpdatesBuf = nextBuf;
+    return s;
+  });
 }
 
 export function listAccounts(state = loadState()) {
@@ -144,14 +239,33 @@ export function localTokenList(state = loadState()) {
 
 export function upsertAccount(state, account) {
   const idx = state.accounts.findIndex((a) =>
-  (account.ilinkBotId && a.ilinkBotId === account.ilinkBotId)
-  || (account.token && a.token === account.token));
+    (account.ilinkBotId && a.ilinkBotId === account.ilinkBotId)
+    || (account.token && a.token === account.token),
+  );
   if (idx >= 0) {
-    state.accounts[idx] = { ...state.accounts[idx], ...account };
-    const [updated] = state.accounts.splice(idx, 1);
-    state.accounts.unshift(updated);
+    const prev = state.accounts[idx];
+    const merged = {
+      ...emptyAccount(),
+      ...prev,
+      ...account,
+      contextTokens:
+        account.contextTokens && Object.keys(account.contextTokens).length > 0
+          ? { ...(prev.contextTokens || {}), ...account.contextTokens }
+          : (prev.contextTokens || {}),
+      typingTickets:
+        account.typingTickets && Object.keys(account.typingTickets).length > 0
+          ? { ...(prev.typingTickets || {}), ...account.typingTickets }
+          : (prev.typingTickets || {}),
+      wake: account.wake !== undefined ? account.wake : (prev.wake ?? null),
+      dedicatedAssistant:
+        account.dedicatedAssistant !== undefined
+          ? account.dedicatedAssistant
+          : (prev.dedicatedAssistant ?? null),
+    };
+    state.accounts.splice(idx, 1);
+    state.accounts.unshift(merged);
   } else {
-    state.accounts.unshift(account);
+    state.accounts.unshift({ ...emptyAccount(), ...account });
   }
   return state;
 }
@@ -202,16 +316,34 @@ export function isAllowed(state, userId) {
 export function appendInbox(messages) {
   if (!messages.length) return;
   ensureHome();
-  const { inbox } = paths();
+  const { inbox, inboxLock } = paths();
   const lines = messages.map((m) => JSON.stringify(m)).join("\n") + "\n";
-  fs.appendFileSync(inbox, lines);
+  withFileLock(inboxLock, () => {
+    fs.appendFileSync(inbox, lines, { mode: 0o600 });
+  });
 }
 
 export function drainInbox() {
-  const { inbox } = paths();
-  if (!fs.existsSync(inbox)) return [];
-  const raw = fs.readFileSync(inbox, "utf8");
-  fs.writeFileSync(inbox, "");
+  const { inbox, inboxLock } = paths();
+  const raw = withFileLock(inboxLock, () => {
+    if (!fs.existsSync(inbox)) return "";
+    const claim = uniqueTmp(inbox);
+    try {
+      fs.renameSync(inbox, claim);
+    } catch {
+      return "";
+    }
+    try {
+      return fs.readFileSync(claim, "utf8");
+    } finally {
+      try {
+        fs.unlinkSync(claim);
+      } catch {
+        // ignore
+      }
+    }
+  });
+  if (!raw) return [];
   return raw
     .split("\n")
     .map((line) => line.trim())
@@ -229,27 +361,44 @@ export function drainInbox() {
 export function peekInboxCount() {
   const { inbox } = paths();
   if (!fs.existsSync(inbox)) return 0;
-  return fs
-    .readFileSync(inbox, "utf8")
-    .split("\n")
-    .filter((line) => line.trim()).length;
+  try {
+    return fs
+      .readFileSync(inbox, "utf8")
+      .split("\n")
+      .filter((line) => line.trim()).length;
+  } catch {
+    return 0;
+  }
 }
 
 export function writePid(pid) {
   ensureHome();
-  fs.writeFileSync(paths().pid, String(pid));
+  const pidPath = paths().pid;
+  const tmp = uniqueTmp(pidPath);
+  fs.writeFileSync(tmp, String(pid), { mode: 0o600 });
+  fs.renameSync(tmp, pidPath);
 }
 
 export function readPid() {
   const { pid } = paths();
   if (!fs.existsSync(pid)) return 0;
-  const n = Number(fs.readFileSync(pid, "utf8").trim());
-  return Number.isInteger(n) && n > 0 ? n : 0;
+  try {
+    const n = Number(fs.readFileSync(pid, "utf8").trim());
+    return Number.isInteger(n) && n > 0 ? n : 0;
+  } catch {
+    return 0;
+  }
 }
 
-export function clearPid() {
+export function clearPid(expectedPid) {
   const { pid } = paths();
-  if (fs.existsSync(pid)) fs.unlinkSync(pid);
+  if (!fs.existsSync(pid)) return;
+  if (expectedPid !== undefined && readPid() !== expectedPid) return;
+  try {
+    fs.unlinkSync(pid);
+  } catch {
+    // ignore
+  }
 }
 
 export function isPidAlive(pid) {
@@ -268,12 +417,33 @@ export function monitorEntryPath() {
 
 function sameFile(token, entry) {
   if (token === entry) return true;
-  if (!token || token.startsWith("-") || !token.includes(path.sep)) return false;
+  if (!token || token.startsWith("-")) return false;
   try {
-    return fs.realpathSync(token) === fs.realpathSync(entry);
+    const resolvedToken = path.isAbsolute(token) ? token : null;
+    if (!resolvedToken) return false;
+    return fs.realpathSync(resolvedToken) === fs.realpathSync(entry);
   } catch {
     return false;
   }
+}
+
+function sameLinuxEntry(pid, argv, entry) {
+  if (argv.some((arg) => sameFile(arg, entry))) return true;
+  try {
+    const cwd = fs.realpathSync(`/proc/${pid}/cwd`);
+    const targetReal = fs.realpathSync(entry);
+    for (const arg of argv) {
+      if (!arg || arg.startsWith("-") || path.isAbsolute(arg)) continue;
+      try {
+        if (fs.realpathSync(path.resolve(cwd, arg)) === targetReal) return true;
+      } catch {
+        // ignore non-existent candidate
+      }
+    }
+  } catch {
+    // ignore unreadable /proc/<pid>/cwd
+  }
+  return false;
 }
 
 function containsArg(line, token) {
@@ -329,32 +499,93 @@ function commandLineIsMonitor(line, entry) {
 }
 
 // Linux thread ids share the pid namespace, so kill(pid, 0) can succeed for a
-// live thread inside the MCP host. A recorded id counts only when argv is this
-// install's server entry plus --monitor.
+// live thread inside the MCP host. On Linux /proc/<pid> top-level entries are
+// process group leaders only, and we verify argv resolves to this install's
+// server entry plus --monitor.
 export function isMonitorProcess(pid) {
   if (!isPidAlive(pid)) return false;
   const entry = monitorEntryPath();
   if (process.platform === "linux") {
+    if (!fs.existsSync(`/proc/${pid}`)) return false;
     const argv = readLinuxArgv(pid);
-    return Boolean(argv && argv.includes("--monitor") && argv.some((arg) => sameFile(arg, entry)));
+    return Boolean(argv && argv.includes("--monitor") && sameLinuxEntry(pid, argv, entry));
   }
   const info = readPosixCommand(pid);
   if (!info || path.basename(info.comm) !== path.basename(process.execPath)) return false;
   return commandLineIsMonitor(info.args, entry);
 }
 
+export function isMcpServerProcess(pid) {
+  if (!isPidAlive(pid)) return false;
+  const entry = monitorEntryPath();
+  if (process.platform === "linux") {
+    if (!fs.existsSync(`/proc/${pid}`)) return false;
+    const argv = readLinuxArgv(pid);
+    return Boolean(
+      argv
+        && !argv.includes("--monitor")
+        && !argv.includes("--uninstall")
+        && !argv.includes("--ensure-monitor")
+        && sameLinuxEntry(pid, argv, entry),
+    );
+  }
+  const info = readPosixCommand(pid);
+  if (!info || path.basename(info.comm) !== path.basename(process.execPath)) return false;
+  if (containsArg(info.args, "--monitor") || containsArg(info.args, "--uninstall") || containsArg(info.args, "--ensure-monitor")) {
+    return false;
+  }
+  return containsArg(info.args, entry) || containsArg(info.args, "server/index.js");
+}
+
+export function listAllProcessPids() {
+  if (process.platform === "linux") {
+    try {
+      return fs
+        .readdirSync("/proc")
+        .filter((name) => /^\d+$/.test(name))
+        .map((name) => Number(name))
+        .filter((n) => Number.isInteger(n) && n > 0);
+    } catch {
+      return [];
+    }
+  }
+  try {
+    const out = execFileSync("ps", ["-ax", "-o", "pid="], {
+      encoding: "utf8",
+      timeout: 2000,
+      stdio: ["ignore", "pipe", "ignore"],
+    });
+    return out
+      .split("\n")
+      .map((s) => Number(s.trim()))
+      .filter((n) => Number.isInteger(n) && n > 0);
+  } catch {
+    return [];
+  }
+}
+
+export function findAllMonitorPids() {
+  const found = new Set();
+  const recorded = readPid();
+  if (recorded && isMonitorProcess(recorded)) found.add(recorded);
+  for (const pid of listAllProcessPids()) {
+    if (isMonitorProcess(pid)) found.add(pid);
+  }
+  return [...found];
+}
+
 export function monitorRunning() {
   const pid = readPid();
   if (!pid) return 0;
   if (isMonitorProcess(pid)) return pid;
-  clearPid();
+  clearPid(pid);
   return 0;
 }
 
 export function stopMonitorProcess() {
   const pid = monitorRunning();
   if (!pid || !isMonitorProcess(pid)) {
-    if (pid) clearPid();
+    if (pid) clearPid(pid);
     return 0;
   }
   try {
@@ -362,7 +593,7 @@ export function stopMonitorProcess() {
   } catch {
     // already gone
   }
-  clearPid();
+  clearPid(pid);
   return pid;
 }
 
@@ -385,8 +616,8 @@ export function loadFallbackWake() {
 export function saveGlobalWake(url, key) {
   ensureHome();
   const wakeFile = fallbackWakePath();
-  const tmp = `${wakeFile}.tmp`;
-  fs.writeFileSync(tmp, JSON.stringify({ url, key }, null, 2));
+  const tmp = uniqueTmp(wakeFile);
+  fs.writeFileSync(tmp, JSON.stringify({ url, key }, null, 2), { mode: 0o600 });
   fs.renameSync(tmp, wakeFile);
   try {
     fs.chmodSync(wakeFile, 0o600);
@@ -410,9 +641,46 @@ export function hasAccountWake(account) {
 
 export function saveStateSecure(next) {
   saveState(next);
+}
+
+export function pruneOldMedia(maxAgeMs = 7 * 24 * 60 * 60 * 1000) {
+  const { media } = paths();
+  if (!fs.existsSync(media)) return 0;
+  const cutoff = Date.now() - maxAgeMs;
+  let removed = 0;
   try {
-    fs.chmodSync(paths().state, 0o600);
+    for (const entry of fs.readdirSync(media)) {
+      const full = path.join(media, entry);
+      try {
+        const st = fs.lstatSync(full);
+        if (st.isFile() && st.mtimeMs < cutoff) {
+          fs.unlinkSync(full);
+          removed += 1;
+        }
+      } catch {
+        // ignore concurrent removal
+      }
+    }
   } catch {
     // ignore
+  }
+  return removed;
+}
+
+export function rotateLogIfNeeded(logPath = paths().log, maxBytes = 5 * 1024 * 1024) {
+  try {
+    if (!fs.existsSync(logPath)) return false;
+    const st = fs.statSync(logPath);
+    if (st.size <= maxBytes) return false;
+    const rotated = `${logPath}.1`;
+    fs.renameSync(logPath, rotated);
+    try {
+      fs.chmodSync(rotated, 0o600);
+    } catch {
+      // ignore
+    }
+    return true;
+  } catch {
+    return false;
   }
 }

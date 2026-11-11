@@ -1,24 +1,47 @@
-import { execSync, spawn } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { clearPid, homeDir, isMonitorProcess, listAccounts, loadState, monitorRunning } from "./store.js";
+import {
+  clearPid,
+  findAllMonitorPids,
+  homeDir,
+  isMcpServerProcess,
+   isMonitorProcess,
+  listAccounts,
+  listAllProcessPids,
+  loadState,
+} from "./store.js";
 
-const PLUGIN_DIR_NAMES = ["grok-wechat-plugin"];
+const PLUGIN_DIR_NAMES = new Set(["grok-wechat-plugin", "grok-wechat"]);
 const GROK_BOX_HOME = "/home/box";
-const MONITOR_MATCH = "grok-wechat-plugin/server/index.js --monitor";
-const MCP_MATCH = "grok-wechat-plugin/server/index.js";
+
+function hasGrokWechatManifest(dir) {
+  try {
+    const manifestPath = path.join(dir, "plugin.json");
+    if (!fs.existsSync(manifestPath)) return false;
+    const data = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
+    return data?.name === "grok-wechat";
+  } catch {
+    return false;
+  }
+}
 
 function isPluginDir(dir) {
   if (!dir || !fs.existsSync(dir)) return false;
-  return PLUGIN_DIR_NAMES.includes(path.basename(path.resolve(dir)));
+  const resolved = path.resolve(dir);
+  if (resolved === "/" || resolved === os.homedir() || resolved === GROK_BOX_HOME || resolved === "/workspace") {
+    return false;
+  }
+  return PLUGIN_DIR_NAMES.has(path.basename(resolved)) && hasGrokWechatManifest(resolved);
 }
 
 export function knownStateHomes() {
   const homes = new Set([
     path.join(GROK_BOX_HOME, ".grok-wechat"),
     path.join(os.homedir(), ".grok-wechat"),
+    "/workspace/.grok-wechat",
   ]);
   const envHome = process.env.GROK_WECHAT_HOME?.trim();
   if (envHome) homes.add(path.resolve(envHome));
@@ -29,7 +52,9 @@ export function knownStateHomes() {
 export function knownPluginDirs() {
   const dirs = new Set([
     path.join(GROK_BOX_HOME, "grok-wechat-plugin"),
+    path.join(GROK_BOX_HOME, "grok-wechat"),
     "/workspace/grok-wechat-plugin",
+    "/workspace/grok-wechat",
   ]);
   try {
     const here = path.dirname(fileURLToPath(import.meta.url));
@@ -41,29 +66,9 @@ export function knownPluginDirs() {
   return [...dirs];
 }
 
-function sh(cmd) {
-  return execSync(cmd, { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
-}
-
-function listMonitorPids() {
-  const pids = new Set();
-  const running = monitorRunning();
-  if (running) pids.add(running);
-  try {
-    const out = sh(`pgrep -f "${MONITOR_MATCH}" 2>/dev/null || true`);
-    for (const line of out.split("\n")) {
-      const n = Number(line.trim());
-      if (Number.isInteger(n) && n > 0 && isMonitorProcess(n)) pids.add(n);
-    }
-  } catch {
-    // ignore
-  }
-  return [...pids];
-}
-
 export function stopAllMonitors() {
   const stopped = [];
-  for (const pid of listMonitorPids()) {
+  for (const pid of findAllMonitorPids()) {
     if (!isMonitorProcess(pid)) continue;
     try {
       process.kill(pid, "SIGTERM");
@@ -73,17 +78,16 @@ export function stopAllMonitors() {
     }
   }
   clearPid();
-  try {
-    sh(`pkill -TERM -f "${MONITOR_MATCH}" 2>/dev/null || true`);
-  } catch {
-    // ignore
-  }
   return [...new Set(stopped)];
 }
 
 function removeDir(target) {
   if (!target || !fs.existsSync(target)) return false;
-  fs.rmSync(target, { recursive: true, force: true });
+  const resolved = path.resolve(target);
+  if (resolved === "/" || resolved === os.homedir() || resolved === GROK_BOX_HOME || resolved === "/workspace") {
+    return false;
+  }
+  fs.rmSync(resolved, { recursive: true, force: true });
   return true;
 }
 
@@ -110,114 +114,104 @@ function lineMatchesAutostart(line) {
   return /grok-wechat|ensure-monitor\.sh/.test(text);
 }
 
-function stripAutostartFromFile(filePath) {
+export function stripAutostartFromFile(filePath) {
   if (!filePath || !fs.existsSync(filePath)) return false;
   const original = fs.readFileSync(filePath, "utf8");
   const lines = original.split("\n");
   const kept = lines.filter((line) => !lineMatchesAutostart(line));
   if (kept.length === lines.length) return false;
   const next = kept.join("\n");
-  if (next.trim()) fs.writeFileSync(filePath, next.endsWith("\n") ? next : `${next}\n`);
-  else fs.unlinkSync(filePath);
+  if (next.trim()) {
+    fs.writeFileSync(filePath, next.endsWith("\n") ? next : `${next}\n`);
+  } else {
+    // Preserve profile file rather than deleting user's .bashrc / .profile
+    fs.writeFileSync(filePath, "");
+  }
   return true;
 }
 
 export function removeAutostartEntries() {
   const touched = [];
-  const profileFiles = [
+  const profileFiles = new Set([
     path.join(GROK_BOX_HOME, ".profile"),
     path.join(GROK_BOX_HOME, ".bashrc"),
     path.join(GROK_BOX_HOME, ".bash_profile"),
     path.join(os.homedir(), ".profile"),
     path.join(os.homedir(), ".bashrc"),
     path.join(os.homedir(), ".bash_profile"),
-  ];
+  ]);
   for (const file of profileFiles) {
     if (stripAutostartFromFile(file)) touched.push(file);
   }
   try {
-    const current = sh("crontab -l 2>/dev/null || true");
+    const current = execFileSync("crontab", ["-l"], {
+      encoding: "utf8",
+      timeout: 3000,
+      stdio: ["ignore", "pipe", "ignore"],
+    }).trim();
     if (current) {
       const lines = current.split("\n");
       const kept = lines.filter((line) => !lineMatchesAutostart(line));
       if (kept.length !== lines.length) {
-        const tmp = path.join(os.tmpdir(), `grok-wechat-crontab-${process.pid}`);
-        fs.writeFileSync(tmp, kept.join("\n") + (kept.length ? "\n" : ""));
-        sh(`crontab "${tmp}"`);
-        fs.unlinkSync(tmp);
+        if (!kept.some((l) => l.trim())) {
+          try {
+            execFileSync("crontab", ["-r"], { timeout: 3000, stdio: "ignore" });
+          } catch {
+            // ignore
+          }
+        } else {
+          const tmp = path.join(os.tmpdir(), `grok-wechat-crontab-${process.pid}-${Date.now()}`);
+          fs.writeFileSync(tmp, `${kept.join("\n")}\n`, { mode: 0o600 });
+          try {
+            execFileSync("crontab", [tmp], { timeout: 3000, stdio: "ignore" });
+          } finally {
+            try {
+              fs.unlinkSync(tmp);
+            } catch {
+              // ignore
+            }
+          }
+        }
         touched.push("crontab");
       }
     }
   } catch {
-    // ignore
+    // crontab not installed or user has no crontab
   }
   return touched;
 }
 
 function mcpStillRunning() {
-  try {
-    const out = sh(`pgrep -f "${MCP_MATCH}" 2>/dev/null || true`);
-    for (const line of out.split("\n")) {
-      const pid = Number(line.trim());
-      if (!Number.isFinite(pid) || pid <= 0) continue;
-      const args = sh(`ps -p ${pid} -o args= 2>/dev/null || true`);
-      if (args && !args.includes("--monitor") && !args.includes("--uninstall")) return true;
-    }
-  } catch {
-    // ignore
+  for (const pid of listAllProcessPids()) {
+    if (isMcpServerProcess(pid)) return true;
   }
   return false;
 }
 
-let mcpGoneSince = 0;
-
 export function connectorAbandoned() {
-  if (mcpStillRunning()) {
-    mcpGoneSince = 0;
-    return false;
-  }
-  if (!mcpGoneSince) mcpGoneSince = Date.now();
-  return Date.now() - mcpGoneSince > 30_000;
+  // Never auto-uninstall based on transient MCP process absence: MCP hosts may
+  // stop idle stdio servers or restart them across turns/reboots.
+  return false;
 }
 
 export function touchConnectorActive() {
-  for (const home of knownStateHomes()) {
-    try {
-      fs.mkdirSync(home, { recursive: true });
-      fs.writeFileSync(path.join(home, "connector-active"), `${Date.now()}\n`);
-    } catch {
-      // ignore
-    }
-  }
+  // Retained as a safe no-op for compatibility.
 }
-
-function deferredCleanupShell() {
-  const stateDirs = knownStateHomes().map((d) => `"${d}"`).join(" ");
-  const pluginDirs = knownPluginDirs().map((d) => `"${d}"`).join(" ");
-  return `
-sleep 3
-if pgrep -f "${MCP_MATCH}" >/dev/null 2>&1; then
-  for pid in $(pgrep -f "${MCP_MATCH}" 2>/dev/null || true); do
-    args=$(ps -p "$pid" -o args= 2>/dev/null || true)
-    case "$args" in *--monitor*|*--uninstall*) ;; *) exit 0 ;; esac
-  done
-fi
-pkill -TERM -f "${MONITOR_MATCH}" 2>/dev/null || true
-for d in ${stateDirs}; do rm -rf "$d" 2>/dev/null || true; done
-for d in ${pluginDirs}; do rm -rf "$d" 2>/dev/null || true; done
-for f in /home/box/.profile /home/box/.bashrc /home/box/.bash_profile "$HOME/.profile" "$HOME/.bashrc" "$HOME/.bash_profile"; do
-  [ -f "$f" ] || continue
-  grep -v -E 'grok-wechat|ensure-monitor\\.sh' "$f" > "$f.tmp" 2>/dev/null && mv "$f.tmp" "$f" || true
-done
-crontab -l 2>/dev/null | grep -v -E 'grok-wechat|ensure-monitor\\.sh' | crontab - 2>/dev/null || true
-`.trim();
-}
-
-let shutdownHookRegistered = false;
 
 export function scheduleDeferredUninstall() {
   try {
-    const child = spawn("sh", ["-c", deferredCleanupShell()], {
+    const targets = [
+      ...knownStateHomes(),
+      ...knownPluginDirs().filter((d) => isPluginDir(d)),
+    ];
+    if (!targets.length) return true;
+    const script = [
+      "sleep 2",
+      'for d in "$@"; do',
+      '  [ -n "$d" ] && [ "$d" != "/" ] && [ "$d" != "/home/box" ] && [ "$d" != "/workspace" ] && rm -rf -- "$d" 2>/dev/null || true',
+      "done",
+    ].join("\n");
+    const child = spawn("sh", ["-c", script, "grok-wechat-deferred-uninstall", ...targets], {
       detached: true,
       stdio: "ignore",
       env: process.env,
@@ -230,14 +224,7 @@ export function scheduleDeferredUninstall() {
 }
 
 export function registerShutdownCleanup() {
-  if (shutdownHookRegistered) return;
-  shutdownHookRegistered = true;
-  const run = () => scheduleDeferredUninstall();
-  process.once("SIGTERM", run);
-  process.once("SIGINT", run);
-  process.once("SIGHUP", run);
-  process.stdin?.once("end", run);
-  process.stdin?.once("close", run);
+  // Retained as a safe no-op: closing MCP stdio must never trigger uninstall.
 }
 
 function collectDedicatedAssistants() {
